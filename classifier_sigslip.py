@@ -125,6 +125,13 @@ class SigLIPMultilingualClassifier:
                 "две рукописные цифры рядом", "короткая числовая запись от руки", "черно-белый скан рукописных цифр",
                 "размашисто написанные цифры от руки", "число написанное с петлей", "рукописная дата с длинным хвостом",
                 "пара цифр с завитком",
+                "короткая последовательность цифр, написанных от руки в одну строку",
+                "рукописная дата из нескольких цифр, разделенных точками",
+                "числовая дата, написанная ручкой в поле документа",
+                "рукописные цифры без букв, образующие дату",
+                "короткая запись числа и месяца от руки",
+                "рукописная дата с цифрами разного размера",
+                "несколько рукописных цифр с точками или косыми чертами между ними",
             ],
             "stamp": [
                 "оттиск круглой печати", "черно-белый оттиск печати", "синий оттиск штампа",
@@ -194,23 +201,61 @@ class SigLIPMultilingualClassifier:
 
     def _score_crops(self, crops: list[Image.Image]):
         inputs = self.processor(images=crops, return_tensors="pt").to(self.device)
+
         with torch.no_grad():
             image_features = self.model.get_image_features(**inputs)
             image_features = image_features / image_features.norm(p=2, dim=-1, keepdim=True)
-            logits_per_image = torch.matmul(image_features, self.text_features.T) * self.logit_scale + self.logit_bias
 
-        n_crops = logits_per_image.shape[0]
-        n_classes = len(self._class_names)
-        class_logits = torch.full((n_crops, n_classes), -float("inf"), device=self.device)
+            logits_per_image = (
+                    torch.matmul(image_features, self.text_features.T)
+                    * self.logit_scale
+                    + self.logit_bias
+            )
 
-        for cls_idx, pidx in enumerate(self._prompt_idx_per_class):
-            cls_logits = logits_per_image[:, pidx]
-            k = min(TOP_K_PROMPTS, cls_logits.shape[1])
-            topk_vals, _ = torch.topk(cls_logits, k, dim=-1)
-            class_logits[:, cls_idx] = topk_vals.mean(dim=-1)
+            n_crops = logits_per_image.shape[0]
+            n_classes = len(self._class_names)
 
-        softmax_probs = torch.softmax(class_logits, dim=-1)
-        sigmoid_probs = torch.sigmoid(class_logits)
+            class_logits = torch.full(
+                (n_crops, n_classes),
+                -float("inf"),
+                device=self.device
+            )
+
+            for cls_idx, pidx in enumerate(self._prompt_idx_per_class):
+                cls_logits = logits_per_image[:, pidx]
+                k = min(TOP_K_PROMPTS, cls_logits.shape[1])
+
+                topk_vals, topk_local_idx = torch.topk(
+                    cls_logits, k, dim=-1
+                )
+
+                # ДИАГНОСТИКА: показываем реальные TOP-3 промпта каждого класса
+                if self.debug:
+                    for crop_idx in range(n_crops):
+                        print(
+                            f"\n[SIGLIP-PROMPT-DEBUG] "
+                            f"batch_crop={crop_idx} "
+                            f"class={self._class_names[cls_idx]}"
+                        )
+
+                        values = topk_vals[crop_idx].detach().cpu().tolist()
+                        indices = topk_local_idx[crop_idx].detach().cpu().tolist()
+
+                        for rank, (value, local_idx) in enumerate(
+                                zip(values, indices), start=1
+                        ):
+                            global_idx = pidx[local_idx]
+                            prompt = self._flat_prompts[global_idx]
+
+                            print(
+                                f"  TOP{rank}: logit={value:.4f} | {prompt}"
+                            )
+
+                class_logits[:, cls_idx] = topk_vals.mean(dim=-1)
+
+            softmax_probs = torch.softmax(class_logits, dim=-1)
+            sigmoid_probs = torch.sigmoid(class_logits)
+
         return softmax_probs.cpu().numpy(), sigmoid_probs.cpu().numpy()
 
     def predict_all(
